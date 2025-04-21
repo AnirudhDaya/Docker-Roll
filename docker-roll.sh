@@ -326,7 +326,7 @@ check_container_health() {
     local container_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $container_id)
     
     for i in $(seq 1 $timeout); do
-        if curl -s -f -o /dev/null "http://${container_ip}:${port}${health_path}"; then
+        if curl -s -f -o /dev/null "http://localhost:${port}${health_path}"; then
             log "SUCCESS" "Container is healthy!"
             return 0
         fi
