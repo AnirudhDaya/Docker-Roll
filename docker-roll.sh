@@ -4,7 +4,7 @@
 
 set -e
 
-VERSION="1.0.4"
+VERSION="1.0.5"
 COMMAND=""
 PROJECT_DIR=$(pwd)
 TRAEFIK_DIR="/home/ssw/traefik"  # Default location of Traefik directory
@@ -314,6 +314,7 @@ EOF
 }
 
 # Check if container is healthy
+# Check if container is healthy
 check_container_health() {
     local container_id=$1
     local health_path=$2
@@ -322,24 +323,42 @@ check_container_health() {
     
     log "INFO" "Waiting for container to be healthy (timeout: ${timeout}s)..."
     
-    # Get container IP
+    # Get container IP and network details
     local container_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $container_id)
+    local network_name=$(docker inspect -f '{{range $net, $conf := .NetworkSettings.Networks}}{{$net}}{{end}}' $container_id | head -n1)
     
+    log "INFO" "Container IP: ${container_ip}, Network: ${network_name}, Port: ${port}"
+    
+    # Try to connect to the container using Docker's exec to ensure network accessibility
     for i in $(seq 1 $timeout); do
-        if curl -s -f -o /dev/null "http://localhost:${port}${health_path}"; then
-            log "SUCCESS" "Container is healthy!"
+        # First try using container IP (works in most cases)
+        if curl -s -f --max-time 2 -o /dev/null "http://${container_ip}:${port}${health_path}"; then
+            log "SUCCESS" "Container health check passed via IP!"
             return 0
         fi
         
-        echo -n "."
+        # If IP doesn't work, try with docker exec (more reliable in some networking setups)
+        if docker exec $container_id curl -s -f --max-time 2 -o /dev/null "http://localhost:${port}${health_path}" 2>/dev/null; then
+            log "SUCCESS" "Container health check passed via exec!"
+            return 0
+        fi
+
+        # Log progress
         if [ $((i % 10)) -eq 0 ]; then
-            echo " $i/${timeout}"
+            log "INFO" "Still waiting for container to be healthy... ${i}/${timeout}s"
+        else
+            echo -n "."
         fi
         
         sleep 1
     done
     
     log "ERROR" "Health check timed out. Container is not healthy."
+    log "INFO" "Debugging: Attempting to get response details..."
+    
+    # Debugging: Try to get more info about the health endpoint
+    docker exec $container_id curl -v "http://localhost:${port}${health_path}" || true
+    
     return 1
 }
 
