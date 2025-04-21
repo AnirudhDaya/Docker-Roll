@@ -257,7 +257,7 @@ create_temp_compose() {
     sed -i "s/traefik.http.services.\${COMPOSE_PROJECT_NAME:-app}/traefik.http.services.${new_service}/g" docker-compose.rolling.yml
     
     # Ensure domain is set correctly
-    sed -i "s/Host(`.*`)/Host(`${domain}`)/g" docker-compose.rolling.yml
+    sed -i "s/Host(\`.*\`)/Host(\`${domain}\`)/g" docker-compose.rolling.yml
     
     # Add deployment ID label
     sed -i "/labels:/a \      - \"deployment.id=${deployment_id}\"" docker-compose.rolling.yml
@@ -403,7 +403,7 @@ perform_rolling_update() {
     log "INFO" "Building and starting new version..."
     if [ "${USE_COLOR_SCHEME}" = true ]; then
         COMPOSE_PROJECT_NAME="${project_name}-${NEW_COLOR}" $DOCKER_COMPOSE -f docker-compose.rolling.yml build --no-cache
-        COMPOSE_PROJECT_NAME="${project_name}-${NEW_COLOR}" $DOCKER_COMPOSE-f docker-compose.rolling.yml up -d
+        COMPOSE_PROJECT_NAME="${project_name}-${NEW_COLOR}" $DOCKER_COMPOSE -f docker-compose.rolling.yml up -d
     else
         COMPOSE_PROJECT_NAME="${project_name}-${DEPLOYMENT_ID}" $DOCKER_COMPOSE -f docker-compose.rolling.yml build --no-cache
         COMPOSE_PROJECT_NAME="${project_name}-${DEPLOYMENT_ID}" $DOCKER_COMPOSE -f docker-compose.rolling.yml up -d
