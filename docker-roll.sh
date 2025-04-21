@@ -4,7 +4,7 @@
 
 set -e
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 COMMAND=""
 PROJECT_DIR=$(pwd)
 TRAEFIK_DIR="/root/traefik"  # Default location of Traefik directory
@@ -73,12 +73,23 @@ log() {
 
 # Check if required tools are installed
 check_requirements() {
-    for cmd in docker docker-compose curl jq; do
+    # Check for required commands
+    for cmd in docker curl jq; do
         if ! command -v $cmd &> /dev/null; then
             log "ERROR" "$cmd is required but not installed. Please install it first."
             exit 1
         fi
     done
+    
+    # Check for docker compose (could be docker-compose or docker compose)
+    if command -v docker-compose &> /dev/null; then
+        DOCKER_COMPOSE="docker-compose"
+    elif docker compose version &> /dev/null; then
+        DOCKER_COMPOSE="docker compose"
+    else
+        log "ERROR" "Neither docker-compose nor docker compose is available. Please install Docker Compose first."
+        exit 1
+    fi
     
     # Check if Traefik is running
     if ! docker ps | grep -q traefik; then
@@ -346,8 +357,8 @@ perform_rolling_update() {
     
     # Build and start new version
     log "INFO" "Building and starting new version..."
-    COMPOSE_PROJECT_NAME="${project_name}-${DEPLOYMENT_ID}" docker-compose -f docker-compose.rolling.yml build --no-cache
-    COMPOSE_PROJECT_NAME="${project_name}-${DEPLOYMENT_ID}" docker-compose -f docker-compose.rolling.yml up -d
+    COMPOSE_PROJECT_NAME="${project_name}-${DEPLOYMENT_ID}" $DOCKER_COMPOSE -f docker-compose.rolling.yml build --no-cache
+    COMPOSE_PROJECT_NAME="${project_name}-${DEPLOYMENT_ID}" $DOCKER_COMPOSE -f docker-compose.rolling.yml up -d
     
     # Get new container ID
     NEW_CONTAINER_ID=$(find_running_container "$SERVICE_NAME" "${project_name}-${DEPLOYMENT_ID}")
@@ -367,7 +378,7 @@ perform_rolling_update() {
     # Check if new container is healthy
     if ! check_container_health "$NEW_CONTAINER_ID" "$HEALTH_CHECK_PATH" "$PORT" "$HEALTH_CHECK_TIMEOUT"; then
         log "ERROR" "New container is not healthy. Rolling back..."
-        COMPOSE_PROJECT_NAME="${project_name}-${DEPLOYMENT_ID}" docker-compose -f docker-compose.rolling.yml down
+        COMPOSE_PROJECT_NAME="${project_name}-${DEPLOYMENT_ID}" $DOCKER_COMPOSE -f docker-compose.rolling.yml down
         rm docker-compose.rolling.yml
         log "INFO" "Rollback complete. Still using old version."
         exit 1
