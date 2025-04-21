@@ -7,7 +7,7 @@ set -e
 VERSION="1.0.1"
 COMMAND=""
 PROJECT_DIR=$(pwd)
-TRAEFIK_DIR="/root/traefik"  # Default location of Traefik directory
+TRAEFIK_DIR="~/traefik"  # Default location of Traefik directory
 DYNAMIC_CONF_DIR="${TRAEFIK_DIR}/data/dynamic_conf"
 
 # Default configuration
