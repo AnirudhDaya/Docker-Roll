@@ -4,7 +4,7 @@
 
 set -e
 
-VERSION="1.0.2"
+VERSION="1.0.3"
 COMMAND=""
 PROJECT_DIR=$(pwd)
 TRAEFIK_DIR="/home/ssw/traefik"  # Default location of Traefik directory
@@ -38,13 +38,14 @@ show_help() {
     echo "Options:"
     echo "  --domain, -d        Domain name for the service (required)"
     echo "  --service, -s       Service name in docker-compose to update (default: app)"
-    echo "  --port, -p          Internal port the service is running on (default: 3000)"
+    echo "  --port, -p          Internal container port the service is running on (default: 3000)"
     echo "  --compose-file, -f  Path to docker-compose file (default: docker-compose.yml)"
     echo "  --health-path       Health check endpoint path (default: /health)"
     echo "  --health-timeout    Health check timeout in seconds (default: 60)"
     echo "  --shift-interval    Time between traffic shifts in seconds (default: 20)"
     echo "  --traefik-dir       Path to Traefik directory (default: /root/traefik)"
     echo "  --no-shift          Deploy without gradual traffic shifting"
+    echo "  --color-scheme      Use blue-green naming instead of timestamps (blue|green)"
     echo ""
     echo "Example:"
     echo "  docker-roll up --domain myapp.example.com --service web --port 8080"
@@ -93,14 +94,14 @@ check_requirements() {
     
     # Check if Traefik is running
     if ! docker ps | grep -q traefik; then
-        log "ERROR" "Traefik container is not running. Please start Traefik first."
-        exit 1
+        log "WARNING" "Traefik container not detected. Make sure it's running."
     fi
     
     # Check if dynamic conf directory exists
     if [ ! -d "$DYNAMIC_CONF_DIR" ]; then
-        log "ERROR" "Traefik dynamic configuration directory not found at $DYNAMIC_CONF_DIR"
-        exit 1
+        log "WARNING" "Traefik dynamic configuration directory not found at $DYNAMIC_CONF_DIR"
+        log "INFO" "Creating directory: $DYNAMIC_CONF_DIR"
+        mkdir -p "$DYNAMIC_CONF_DIR"
     fi
 }
 
@@ -160,6 +161,10 @@ parse_args() {
                 NO_SHIFT=true
                 shift
                 ;;
+            --color-scheme)
+                USE_COLOR_SCHEME=true
+                shift
+                ;;
             *)
                 log "ERROR" "Unknown option: $1"
                 show_help
@@ -209,20 +214,22 @@ find_running_container() {
     echo $CONTAINER_ID
 }
 
-# Get the service labels from docker-compose file
-get_service_labels() {
-    local service=$1
-    local compose_file=$2
+# Find if any container is already running with the blue-green pattern
+check_blue_green_deployment() {
+    local project=$1
+    local service=$2
     
-    # Use yq or alternative method to extract labels from docker-compose.yml
-    if command -v yq &> /dev/null; then
-        LABELS=$(yq eval ".services.$service.labels" $compose_file)
+    # Check if blue or green container exists
+    BLUE_CONTAINER=$(docker ps --filter "name=${project}-blue-${service}" --format "{{.ID}}" | head -n 1)
+    GREEN_CONTAINER=$(docker ps --filter "name=${project}-green-${service}" --format "{{.ID}}" | head -n 1)
+    
+    if [ -n "$BLUE_CONTAINER" ]; then
+        echo "blue"
+    elif [ -n "$GREEN_CONTAINER" ]; then
+        echo "green"
     else
-        # Fallback to grep and sed (less reliable)
-        LABELS=$(cat $compose_file | sed -n "/services:/,/^[^ ]/p" | sed -n "/$service:/,/^[^ ]/p" | grep -A 50 "labels:" | grep -v "^[^ ]")
+        echo ""
     fi
-    
-    echo "$LABELS"
 }
 
 # Create temporary docker-compose file for new version
@@ -239,15 +246,24 @@ create_temp_compose() {
     # Create a copy of the original compose file
     cp $original_file docker-compose.rolling.yml
     
+    # Remove the host port binding to avoid conflicts
+    sed -i 's/ports:/expose:/g' docker-compose.rolling.yml
+    sed -i 's/- "[0-9]*:[0-9]*"/- "'$port'"/g' docker-compose.rolling.yml
+    
     # Replace service name in labels
-    sed -i "s/traefik.http.routers.${service}/traefik.http.routers.${new_service}/g" docker-compose.rolling.yml
-    sed -i "s/traefik.http.services.${service}/traefik.http.services.${new_service}/g" docker-compose.rolling.yml
+    sed -i "s/traefik.http.routers.${SERVICE_NAME}/traefik.http.routers.${new_service}/g" docker-compose.rolling.yml
+    sed -i "s/traefik.http.routers.\${COMPOSE_PROJECT_NAME:-app}/traefik.http.routers.${new_service}/g" docker-compose.rolling.yml
+    sed -i "s/traefik.http.services.${SERVICE_NAME}/traefik.http.services.${new_service}/g" docker-compose.rolling.yml
+    sed -i "s/traefik.http.services.\${COMPOSE_PROJECT_NAME:-app}/traefik.http.services.${new_service}/g" docker-compose.rolling.yml
     
     # Ensure domain is set correctly
-    sed -i "s/Host(\`.*\`)/Host(\`${domain}\`)/g" docker-compose.rolling.yml
+    sed -i "s/Host(`.*`)/Host(`${domain}`)/g" docker-compose.rolling.yml
     
     # Add deployment ID label
     sed -i "/labels:/a \      - \"deployment.id=${deployment_id}\"" docker-compose.rolling.yml
+    
+    # Make sure the container port is correct
+    sed -i "s/server.port=[0-9]*/server.port=${port}/g" docker-compose.rolling.yml
     
     # Ensure healthcheck is configured
     if ! grep -q "healthcheck" docker-compose.rolling.yml; then
@@ -255,9 +271,6 @@ create_temp_compose() {
         sed -i "/labels:/a \      - \"traefik.http.services.${new_service}.loadbalancer.healthcheck.interval=5s\"" docker-compose.rolling.yml
         sed -i "/labels:/a \      - \"traefik.http.services.${new_service}.loadbalancer.healthcheck.timeout=3s\"" docker-compose.rolling.yml
     fi
-    
-    # Ensure port is set correctly
-    sed -i "s/server.port=[0-9]*/server.port=${port}/g" docker-compose.rolling.yml
     
     log "SUCCESS" "Temporary compose file created"
 }
@@ -330,38 +343,78 @@ check_container_health() {
     return 1
 }
 
+# Determine which color deployment to use (blue or green)
+get_deployment_color() {
+    local current_color=$1
+    
+    if [ "$current_color" = "blue" ]; then
+        echo "green"
+    else
+        echo "blue"
+    fi
+}
+
 # Perform rolling update
 perform_rolling_update() {
     local project_name=$(get_project_name)
     log "INFO" "Starting rolling update for project: $project_name"
     
-    # Generate deployment ID
-    DEPLOYMENT_ID=$(date +%s)
-    NEW_SERVICE="${SERVICE_NAME}-${DEPLOYMENT_ID}"
-    
-    # Check if service is already running
-    OLD_CONTAINER_ID=$(find_running_container "$SERVICE_NAME" "$project_name")
-    
-    if [ -z "$OLD_CONTAINER_ID" ]; then
-        log "INFO" "No existing service found. Proceeding with initial deployment."
-        INITIAL_DEPLOYMENT=true
+    # Check if we're using blue-green naming scheme
+    if [ "${USE_COLOR_SCHEME}" = true ]; then
+        # Check if blue or green container is already running
+        CURRENT_COLOR=$(check_blue_green_deployment "$project_name" "$SERVICE_NAME")
+        
+        if [ -z "$CURRENT_COLOR" ]; then
+            # No existing blue/green container, default to blue
+            NEW_COLOR="blue"
+            INITIAL_DEPLOYMENT=true
+        else
+            # Use the opposite color
+            NEW_COLOR=$(get_deployment_color "$CURRENT_COLOR")
+            INITIAL_DEPLOYMENT=false
+        fi
+        
+        DEPLOYMENT_ID="${NEW_COLOR}"
+        log "INFO" "Using ${NEW_COLOR} deployment (current: ${CURRENT_COLOR})"
     else
-        INITIAL_DEPLOYMENT=false
-        OLD_SERVICE=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.service"}}' $OLD_CONTAINER_ID)
-        OLD_PROJECT=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project"}}' $OLD_CONTAINER_ID)
-        log "INFO" "Found existing service: $OLD_SERVICE in project $OLD_PROJECT"
+        # Generate deployment ID based on timestamp
+        DEPLOYMENT_ID=$(date +%s)
+        
+        # Check if service is already running
+        OLD_CONTAINER_ID=$(find_running_container "$SERVICE_NAME" "$project_name")
+        
+        if [ -z "$OLD_CONTAINER_ID" ]; then
+            log "INFO" "No existing service found. Proceeding with initial deployment."
+            INITIAL_DEPLOYMENT=true
+        else
+            INITIAL_DEPLOYMENT=false
+            OLD_SERVICE=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.service"}}' $OLD_CONTAINER_ID)
+            OLD_PROJECT=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project"}}' $OLD_CONTAINER_ID)
+            log "INFO" "Found existing service: $OLD_SERVICE in project $OLD_PROJECT"
+        fi
     fi
+    
+    NEW_SERVICE="${SERVICE_NAME}-${DEPLOYMENT_ID}"
     
     # Create temporary compose file
     create_temp_compose "$DEPLOYMENT_ID" "$SERVICE_NAME" "$COMPOSE_FILE" "$DOMAIN" "$PORT"
     
     # Build and start new version
     log "INFO" "Building and starting new version..."
-    COMPOSE_PROJECT_NAME="${project_name}-${DEPLOYMENT_ID}" $DOCKER_COMPOSE -f docker-compose.rolling.yml build --no-cache
-    COMPOSE_PROJECT_NAME="${project_name}-${DEPLOYMENT_ID}" $DOCKER_COMPOSE -f docker-compose.rolling.yml up -d
+    if [ "${USE_COLOR_SCHEME}" = true ]; then
+        COMPOSE_PROJECT_NAME="${project_name}-${NEW_COLOR}" $DOCKER_COMPOSE -f docker-compose.rolling.yml build --no-cache
+        COMPOSE_PROJECT_NAME="${project_name}-${NEW_COLOR}" $DOCKER_COMPOSE-f docker-compose.rolling.yml up -d
+    else
+        COMPOSE_PROJECT_NAME="${project_name}-${DEPLOYMENT_ID}" $DOCKER_COMPOSE -f docker-compose.rolling.yml build --no-cache
+        COMPOSE_PROJECT_NAME="${project_name}-${DEPLOYMENT_ID}" $DOCKER_COMPOSE -f docker-compose.rolling.yml up -d
+    fi
     
     # Get new container ID
-    NEW_CONTAINER_ID=$(find_running_container "$SERVICE_NAME" "${project_name}-${DEPLOYMENT_ID}")
+    if [ "${USE_COLOR_SCHEME}" = true ]; then
+        NEW_CONTAINER_ID=$(find_running_container "$SERVICE_NAME" "${project_name}-${NEW_COLOR}")
+    else
+        NEW_CONTAINER_ID=$(find_running_container "$SERVICE_NAME" "${project_name}-${DEPLOYMENT_ID}")
+    fi
     
     if [ -z "$NEW_CONTAINER_ID" ]; then
         log "ERROR" "Failed to start new container"
@@ -378,23 +431,38 @@ perform_rolling_update() {
     # Check if new container is healthy
     if ! check_container_health "$NEW_CONTAINER_ID" "$HEALTH_CHECK_PATH" "$PORT" "$HEALTH_CHECK_TIMEOUT"; then
         log "ERROR" "New container is not healthy. Rolling back..."
-        COMPOSE_PROJECT_NAME="${project_name}-${DEPLOYMENT_ID}" $DOCKER_COMPOSE -f docker-compose.rolling.yml down
+        if [ "${USE_COLOR_SCHEME}" = true ]; then
+            COMPOSE_PROJECT_NAME="${project_name}-${NEW_COLOR}" $DOCKER_COMPOSE -f docker-compose.rolling.yml down
+        else
+            COMPOSE_PROJECT_NAME="${project_name}-${DEPLOYMENT_ID}" $DOCKER_COMPOSE -f docker-compose.rolling.yml down
+        fi
         rm docker-compose.rolling.yml
         log "INFO" "Rollback complete. Still using old version."
         exit 1
     fi
     
+    # Get old service details for traffic shifting
+    if [ "${USE_COLOR_SCHEME}" = true ]; then
+        OLD_SERVICE="${project_name}-${CURRENT_COLOR}_${SERVICE_NAME}"
+        NEW_SERVICE="${project_name}-${NEW_COLOR}_${SERVICE_NAME}"
+    else
+        if [ -n "$OLD_CONTAINER_ID" ]; then
+            OLD_SERVICE="${OLD_PROJECT}_${OLD_SERVICE}"
+            NEW_SERVICE="${project_name}-${DEPLOYMENT_ID}_${SERVICE_NAME}"
+        fi
+    fi
+    
     if [ "${NO_SHIFT}" = true ]; then
         # Direct switch without gradual transition
         log "INFO" "Performing direct switch to new version (no gradual shifting)"
-        create_weighted_config "${OLD_PROJECT}_${OLD_SERVICE}" "${project_name}-${DEPLOYMENT_ID}_${SERVICE_NAME}" "$DOMAIN" 0 100 "$project_name"
+        create_weighted_config "${OLD_SERVICE}" "${NEW_SERVICE}" "$DOMAIN" 0 100 "$project_name"
     else
         # Gradually shift traffic from old to new
         for i in $(seq 0 20 100); do
             OLD_WEIGHT=$((100 - i))
             NEW_WEIGHT=$i
             
-            create_weighted_config "${OLD_PROJECT}_${OLD_SERVICE}" "${project_name}-${DEPLOYMENT_ID}_${SERVICE_NAME}" "$DOMAIN" $OLD_WEIGHT $NEW_WEIGHT "$project_name"
+            create_weighted_config "${OLD_SERVICE}" "${NEW_SERVICE}" "$DOMAIN" $OLD_WEIGHT $NEW_WEIGHT "$project_name"
             
             sleep $TRAFFIC_SHIFT_INTERVAL
         done
@@ -404,8 +472,14 @@ perform_rolling_update() {
     
     # Clean up old container
     log "INFO" "Removing old container..."
-    docker stop $OLD_CONTAINER_ID
-    docker rm $OLD_CONTAINER_ID
+    if [ "${USE_COLOR_SCHEME}" = true ]; then
+        $DOCKER_COMPOSE -p "${project_name}-${CURRENT_COLOR}" down
+    else
+        if [ -n "$OLD_CONTAINER_ID" ]; then
+            docker stop $OLD_CONTAINER_ID
+            docker rm $OLD_CONTAINER_ID
+        fi
+    fi
     
     # Clean up temporary files
     rm docker-compose.rolling.yml
